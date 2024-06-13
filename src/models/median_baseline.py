@@ -16,12 +16,21 @@ class MedianBaselineModel(BaseModel):
         self.business_stars_medians = review_train_df.groupby('business_id')['stars'].median()
         self.business_stars_medians_median = self.business_stars_medians.median()
         self.fitted = True
-        self.review_train_df = review_train_df
+        self.users_prev_businesses = review_train_df.groupby('user_id').business_id.unique()
     
     def __get_top(self, user_id: str, business_stars: pd.Series, top_k:int=10):
-        user_prev_businesses = self.review_train_df.loc[self.review_train_df['user_id'] == user_id, 'business_id']
-        business_stars_notvisited = business_stars[~business_stars.index.isin(user_prev_businesses)]
-        return list(business_stars_notvisited.index[:top_k])
+        if user_id in self.users_prev_businesses:
+            user_prev_businesses = self.users_prev_businesses.loc[user_id]
+        else:
+            user_prev_businesses = []
+
+        business_stars_notvisited = []
+        for business_id, business_stars in business_stars.items():
+            if business_id not in user_prev_businesses:
+                business_stars_notvisited.append(business_id)
+            if len(business_stars_notvisited) >= top_k:
+                break
+        return business_stars_notvisited
 
     def predict(self, review_val_df: pd.DataFrame, user_df: pd.DataFrame, business_df: pd.DataFrame, predict_per_user: int = 10) -> np.ndarray | pd.Series:
         if not self.fitted:

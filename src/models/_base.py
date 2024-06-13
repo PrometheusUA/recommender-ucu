@@ -117,8 +117,8 @@ class BaseModel:
 
                 review_small_train_div = review_df_small['date'].sort_values().reset_index(drop=True).loc[int(len(review_df_small) * ((tfold + 1)/(tfold + 2)))]
             else:
-                review_small_div = sorted_reviews_time.iloc[-short_eval_train_samples]
-                review_df_small = review_df.loc[review_df['date'] > review_small_div]
+                review_small_div = sorted_reviews_time.iloc[short_eval_train_samples]
+                review_df_small = review_df.loc[review_df['date'] <= review_small_div]
 
                 review_small_train_div = review_df_small['date'].sort_values().reset_index(drop=True).loc[int(short_eval_train_samples * (1 - short_eval_val_size))]
 
