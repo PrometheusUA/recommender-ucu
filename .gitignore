@@ -1,3 +1,4 @@
 .venv
 data/yelp_dataset
+data/glove.*.txt
 __pycache__

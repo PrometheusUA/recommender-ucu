@@ -3,6 +3,8 @@ from typing import Iterable, Union
 import pandas as pd
 import numpy as np
 
+from tqdm import tqdm
+
 from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score, f1_score, precision_score, recall_score
 
 
@@ -22,17 +24,21 @@ class BaseModel:
     def predict(self, 
                 review_val_df: pd.DataFrame, 
                 user_df: pd.DataFrame, 
-                business_df: pd.DataFrame) -> Union[np.ndarray, pd.Series]:
+                business_df: pd.DataFrame, 
+                predict_per_user: int = 10) -> Union[np.ndarray, pd.Series]:
         print("WARNING! Predict function is not overrided!")
         return np.ones((len(review_val_df)))
 
     def __metrics(self,
-                  real_stars: Union[np.array, pd.Series],
-                  predicted_stars: Union[np.array, pd.Series]):
-        # classification
+                  review_df: pd.DataFrame,
+                  predicted_stars: Union[np.array, pd.Series],
+                  user_suggestions: pd.Series,
+                  suggestions_len: int = 10):
+        real_stars = review_df[self.target_col]
+        # regression
         rmse = np.sqrt(mean_squared_error(real_stars, predicted_stars))
         mae = mean_absolute_error(real_stars, predicted_stars)
-        # regression
+        # classification
         unique_stars = np.array(self.unique_stars,dtype=np.float32)
         # In case predicted stars are "between" existing classes, we need to adjust them to valid stars
         predicted_stars_classes = unique_stars[np.abs(predicted_stars.values.reshape((-1, 1)) - unique_stars.reshape((1, -1))).argmin(axis=1)]
@@ -42,8 +48,25 @@ class BaseModel:
         precision = precision_score(real_stars, predicted_stars_classes, average='macro', zero_division=1.0)
         recall = recall_score(real_stars, predicted_stars_classes, average='macro', zero_division=1.0)
 
-        # ranking
-        ## TODO: add ranking metrics
+        # ranking mean precision @1, mean precision @3, mean precision @ K, MAP
+        relevant_business_reviews = review_df[review_df[self.target_col] >= 4]
+        relevant_user_businesses = relevant_business_reviews.groupby('user_id')['business_id'].apply(list)
+        relevant_user_businesses.name = "relevant_items"
+
+        user_suggestions.name = "user_suggestions"
+        user_relevant_vs_suggested = pd.merge(relevant_user_businesses, user_suggestions, how='outer', left_index=True, right_index=True)
+
+        average_precisions_at_k = []
+        user_relevant_vs_suggested = user_relevant_vs_suggested.map(lambda x: [] if (isinstance(x, float) and pd.isna(x)) else x)
+        for k in range(1, suggestions_len + 1):
+            user_relevant_vs_suggested['user_suggestions_topk'] = user_relevant_vs_suggested['user_suggestions'].apply(lambda x: x[:k])
+            user_relevant_vs_suggested['relevant_topk'] = user_relevant_vs_suggested.apply(lambda row: len(set(row["user_suggestions_topk"]) & set(row["relevant_items"])), axis=1)
+
+            average_precision_at_k = user_relevant_vs_suggested['relevant_topk'].mean() / k
+            average_precisions_at_k.append(average_precision_at_k)
+
+        map_k = np.mean(average_precisions_at_k)
+
         return {
             "rmse": rmse,
             "mae": mae,
@@ -52,6 +75,11 @@ class BaseModel:
             "f1": f1,
             "precision": precision,
             "recall": recall,
+
+            "AP@1": average_precisions_at_k[0],
+            "AP@3": average_precisions_at_k[2],
+            "AP@K": average_precisions_at_k[-1],
+            "MAP@K": map_k,
         }
     
     @staticmethod
@@ -73,7 +101,8 @@ class BaseModel:
                  short_eval: bool = False,
                  short_eval_train_samples: int = 1000,
                  short_eval_val_size: float = 0.1,
-                 time_folds_count: int = 5
+                 time_folds_count: int = 5,
+                 predict_per_user: int = 10
                 ) -> dict:
         sorted_reviews_time = review_df['date'].sort_values().reset_index(drop=True)
         if short_eval:
@@ -81,7 +110,7 @@ class BaseModel:
         
         folds_metrics = []
 
-        for tfold in range(time_folds_count):
+        for tfold in tqdm(range(time_folds_count), desc="Evaluation fold"):
             if not short_eval:
                 review_small_div = sorted_reviews_time.loc[min(int(len(review_df) * ((2 + tfold) / (1 + time_folds_count))), len(review_df) - 1)]
                 review_df_small = review_df.loc[review_df['date'] < review_small_div]
@@ -103,10 +132,10 @@ class BaseModel:
             business_val_df = business_df.loc[business_df['business_id'].isin(review_val_df['business_id'].unique())]
 
             self.fit(review_train_df, user_train_df, business_train_df)
-            predicted_stars = self.predict(review_val_df, user_val_df, business_val_df)
+            predicted_stars, user_suggestions = self.predict(review_val_df, user_val_df, business_val_df, predict_per_user)
 
-            metrics = self.__metrics(review_val_df[self.target_col], predicted_stars)
+            metrics = self.__metrics(review_val_df, predicted_stars, user_suggestions, predict_per_user)
 
             folds_metrics.append(metrics)
-        
+
         return BaseModel.__average_folds_metrics(folds_metrics)
