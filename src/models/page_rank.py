@@ -6,6 +6,7 @@ import numpy as np
 import sys
 sys.path.append('../../')
 from src.models._base import BaseModel
+from src.models.median_baseline import MedianBaselineModel
 from src.utils import read_json_df
 import random
 from typing import Iterable, Union
@@ -13,6 +14,7 @@ import networkx as nx
 import sklearn.metrics.pairwise
 from scipy import sparse
 import warnings
+import tqdm
 warnings.filterwarnings("ignore")
 
 class PageRankModel(BaseModel):
@@ -37,6 +39,9 @@ class PageRankModel(BaseModel):
                                 review_df.business_id.cat.codes))).toarray()
         
         dist = sklearn.metrics.pairwise.pairwise_distances(matrix,matrix)
+        dist/=dist.max()
+        dist=1-dist
+        np.fill_diagonal(dist,0)
         self.G = nx.from_numpy_array(dist)
     def fit(self, 
             review_train_df: pd.DataFrame, 
@@ -61,10 +66,10 @@ class PageRankModel(BaseModel):
         # Page rank could not predict stars.
         stars = np.ones((len(review_val_df)))
         total_df = pd.Series()
-        for i in user_df.user_id:
+        for i in user_df.user_id.unique():
             idx = self.train_df[self.train_df.user_id == i].user_id.cat.codes.max()
             if pd.isnull(idx):
-                df = pd.Series(self.sorted[:predict_per_user],index=[i]*predict_per_user)
+                df = pd.Series([self.sorted[:predict_per_user].tolist()],index=[i])
                 total_df = pd.concat([total_df,df])
             else:
                 best = nx.pagerank(self.G,personalization={idx:100000})
@@ -73,11 +78,12 @@ class PageRankModel(BaseModel):
 
                 # Add weights to calculate best business
                 ratings['weight'] = self.train_df['user_codes'].apply(lambda x:best[x])
-                ratings['stars']*=ratings['weight']
+                ratings.loc[ratings['user_id'].cat.codes == idx,'stars'] = 0
+                ratings['stars']=(ratings['stars'] - 1.5) * ratings['weight']
 
                 # Sort by weighted sum
                 ratings = ratings.groupby('business_id').stars.sum().sort_values()[::-1].reset_index()['business_id']
-                df = pd.Series(ratings[:predict_per_user].to_list(),index=[i]*predict_per_user)
+                df = pd.Series([ratings[:predict_per_user].to_list()],index=[i] )
                 
                 total_df = pd.concat([total_df,df])
         return pd.Series(stars),total_df
