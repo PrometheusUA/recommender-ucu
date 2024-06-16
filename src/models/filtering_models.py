@@ -3,27 +3,24 @@ import string
 import sys
 sys.path.append('../../')
 
-from os.path import join as pjoin
-
 import pandas as pd
 import numpy as np
-import faiss
 import nltk
 
 from sklearn.metrics.pairwise import cosine_similarity
 from nltk.corpus import stopwords
-from scipy.sparse import csr_matrix, coo_matrix
-from sklearn.decomposition import TruncatedSVD
+from scipy.sparse import coo_matrix
 
-from src.utils import read_json_df
 from src.models._base import BaseModel
+
 
 nltk.download('stopwords')
 
-glove_file = '../../data/glove.6B.100d.txt'
+GLOVE_FILE = '../../data/glove.6B.100d.txt'
+
 
 class ContentBasedModel(BaseModel):
-    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.], glove_file=glove_file):
+    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.], glove_file=GLOVE_FILE):
         super().__init__(target_col, unique_stars)
         self.embeddings_index = {}
         self.restaurant_vectors = None
@@ -58,21 +55,46 @@ class ContentBasedModel(BaseModel):
             some_key = list(self.embeddings_index.keys())[0]
             return np.zeros(self.embeddings_index[some_key].shape)
 
+    def obtain_user_vector(self, user_reviews_df: pd.DataFrame):
+        mean_stars = user_reviews_df['stars'].mean()
+        positive_mask = user_reviews_df['stars'] >= mean_stars
+        # negative_mask = user_reviews_df['stars'] < median_stars
+
+        # if positive_mask.sum() + negative_mask.sum() == 0:
+        #     return None
+
+        vectors_list = []
+        for id in user_reviews_df.index[positive_mask]:
+            vectors_list.append(self.restaurant_vectors[user_reviews_df.loc[id, 'business_id']])
+
+        # for id in user_reviews_df.index[negative_mask]:
+        #     vectors_list.append(- (user_reviews_df.loc[id, 'stars'] - median_stars + 1e-3)**2 * self.restaurant_vectors[user_reviews_df.loc[id, 'business_id']])
+
+        # positive_vectors = ((user_reviews_df.loc[positive_mask, 'stars'] - median_stars) * self.restaurant_vectors[user_reviews_df.loc[positive_mask, 'business_id']]).tolist()
+        # negative_vectors = ((user_reviews_df.loc[negative_mask, 'stars'] - median_stars) * self.restaurant_vectors[user_reviews_df.loc[negative_mask, 'business_id']]).tolist()
+
+        return np.mean(np.vstack(vectors_list), axis=0)
+
     def fit(self, review_train_df, user_df, business_df):
         review_train_df['cleaned_text'] = review_train_df['text'].apply(self.preprocess_text)
         review_train_df['review_vector'] = review_train_df['cleaned_text'].apply(lambda x: self.get_average_vector(x))
         review_train_df_filtered = review_train_df[review_train_df['review_vector'].apply(lambda x: not np.allclose(np.zeros(self.embeddings_index[list(self.embeddings_index.keys())[0]].shape), x))]
         
+        self.review_train_df = review_train_df_filtered
+
         self.restaurant_vectors = review_train_df_filtered.groupby('business_id')['review_vector'].apply(lambda x: np.mean(np.vstack(x.tolist()), axis=0))
-        self.user_vectors = review_train_df_filtered.groupby('user_id')['review_vector'].apply(lambda x: np.mean(np.vstack(x.tolist()), axis=0))
-        self.review_train_df = review_train_df_filtered 
-        self.default_restaurant_vector = np.mean(np.vstack(self.restaurant_vectors.tolist()), axis=0)
-        self.defaul_user_vector = np.mean(np.vstack(self.user_vectors.tolist()), axis=0)
+        self.user_vectors = review_train_df_filtered.groupby('user_id').apply(self.obtain_user_vector)
+        
+        self.default_restaurant_vector = self.restaurant_vectors.mean()
+        self.default_user_vector = self.user_vectors.mean()
+
+        # self.user_vectors.loc[pd.isnull(self.user_vectors)] = self.user_vectors.loc[pd.isnull(self.user_vectors)].apply(lambda x: self.default_user_vector)
 
     def recommend_restaurants(self, user_id, review_df, top_n=10):
         if user_id not in self.user_vectors.index:
-            return []
-        user_vector = self.user_vectors[user_id]
+            user_vector = self.default_user_vector
+        else:
+            user_vector = self.user_vectors[user_id]
         visited_restaurants = self.review_train_df[self.review_train_df['user_id'] == user_id]['business_id'].unique()
         unvisited_restaurant_vectors = self.restaurant_vectors[~self.restaurant_vectors.index.isin(visited_restaurants)]
 
@@ -90,221 +112,180 @@ class ContentBasedModel(BaseModel):
         if user_id in self.user_vectors:
             user_vector = self.user_vectors[user_id]
         else:
-            user_vector = self.defaul_user_vector
+            user_vector = self.default_user_vector
         similarity_score = np.dot(user_vector, restaurant_vector) / (np.linalg.norm(user_vector) * np.linalg.norm(restaurant_vector))
-        predicted_rating = similarity_score * 5  # Scale similarity score to star rating
+        predicted_rating = 1 + similarity_score * 4  # Scale similarity score to star rating
         return predicted_rating
 
     def predict(self, review_val_df, user_df, business_df, predict_per_user=10):
         predictions = []
-        user_suggestions = user_df.groupby('user_id')['user_id'].apply(lambda user_id: self.recommend_restaurants(user_id.iloc[0], review_df))
+        user_suggestions = user_df.groupby('user_id')['user_id'].apply(lambda user_id: self.recommend_restaurants(user_id.iloc[0], review_val_df, top_n=predict_per_user))
 
         for _, row in review_val_df[["user_id", "business_id"]].iterrows():
             predictions.append(self.predict_stars(row['user_id'], row['business_id']))
 
         return pd.Series(predictions), user_suggestions
-    
+
+
 class UserUserCollaborativeFiltering(BaseModel):
-    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.]):
+    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.], n_neighbours=20):
         super().__init__(target_col, unique_stars)
         self.user_item_sparse_matrix = None
         self.reduced_matrix = None
         self.index = None
         self.user_ids_df = None
         self.business_ids_df = None
+        self.n_neighbours = n_neighbours
 
     def fit(self, review_train_df, user_df, business_df):
         # Merge dataframes to ensure we have matching records
-        review_df_filtered = review_train_df.merge(user_df[['user_id']], on='user_id', how='inner')
+        review_df_filtered = review_train_df.groupby(['user_id', 'business_id']).agg({'stars':'last','date':'last'}).reset_index()
+        review_df_filtered = review_df_filtered.merge(user_df[['user_id']], on='user_id', how='inner')
         review_df_filtered = review_df_filtered.merge(business_df[['business_id']], on='business_id', how='inner')
         
         # Create user and business ID mappings
-        user_ids = review_df_filtered['user_id'].astype('category').cat.codes
-        business_ids = review_df_filtered['business_id'].astype('category').cat.codes
-        stars = review_df_filtered[self.target_col]
+        user_codes = review_df_filtered['user_id'].astype('category').cat.codes
+        business_codes = review_df_filtered['business_id'].astype('category').cat.codes
+
+        self.median_stars = review_df_filtered['stars'].median()
+
+        stars = review_df_filtered['stars']
 
         # Create the user-item matrix
-        self.user_item_sparse_matrix = coo_matrix((stars, (user_ids, business_ids)))
-        self.user_item_sparse_matrix = self.user_item_sparse_matrix.tocsr()
+        self.user_item_sparse_matrix = coo_matrix((stars, (user_codes, business_codes))).tocsr()
         
         # Create DataFrames for user and business IDs
-        user_ids.name = "user_code"
-        self.user_ids_df = pd.concat((user_ids, review_df_filtered['user_id']), axis=1)
+        user_codes.name = "user_code"
+        self.user_ids_df = pd.concat((user_codes, review_df_filtered['user_id']), axis=1)
 
-        business_ids.name = "business_code"
-        self.business_ids_df = pd.concat((business_ids, review_df_filtered['business_id']), axis=1)
+        business_codes.name = "business_code"
+        self.business_ids_df = pd.concat((business_codes, review_df_filtered['business_id']), axis=1).drop_duplicates()
+
+        self.business_medians = review_df_filtered.groupby('business_id')['stars'].median()
         
-        # Reduce dimensions using SVD
-        svd = TruncatedSVD(n_components=100)
-        self.reduced_matrix = svd.fit_transform(self.user_item_sparse_matrix)
-        self.reduced_matrix = self.reduced_matrix.astype(np.float32)
+        self.user_similarity = cosine_similarity(self.user_item_sparse_matrix, dense_output=False)
 
-        # Create FAISS index
-        self.index = faiss.IndexFlatIP(self.reduced_matrix.shape[1])
-        faiss.normalize_L2(self.reduced_matrix)
-        self.index.add(self.reduced_matrix)
-
-    def recommend_restaurants(self, user_id, review_df, n_recommendations=10, n_neighbours=100):
-        user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].iloc[0]
-        sim_scores, sim_user_codes = self.index.search(self.reduced_matrix[user_code].reshape(1, -1), n_neighbours)
-
-        sim_scores, sim_user_codes = sim_scores[0], sim_user_codes[0]
-        sim_scores = sim_scores[sim_user_codes != user_code]
-        sim_user_codes = sim_user_codes[sim_user_codes != user_code]
-
-        similar_users_ratings = self.user_item_sparse_matrix[sim_user_codes].toarray()
-        avg_similar_users_ratings = similar_users_ratings.mean(axis=0)
-
-        visited_restaurants = review_df[review_df['user_id'] == user_id]['business_id'].unique()
-        visited_business_codes = self.business_ids_df[self.business_ids_df['business_id'].isin(visited_restaurants)]['business_code'].values
-
-        recommendations_codes = [code for code in np.argsort(avg_similar_users_ratings)[::-1] if code not in visited_business_codes][:n_recommendations]
-
-        res = []
-        for code in recommendations_codes:
-            business_id = self.business_ids_df.loc[self.business_ids_df['business_code'] == code, 'business_id'].values[0]
-            res.append(business_id)
-        
-        return res
-
-    def predict_stars(self, user_id, review_df):
-        user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].iloc[0]
-        sim_scores, sim_user_codes = self.index.search(self.reduced_matrix[user_code].reshape(1, -1), 100)
-
-        sim_scores, sim_user_codes = sim_scores[0], sim_user_codes[0]
-        sim_scores = sim_scores[sim_user_codes != user_code]
-        sim_user_codes = sim_user_codes[sim_user_codes != user_code]
-
-        similar_users_ratings = self.user_item_sparse_matrix[sim_user_codes].toarray()
-        avg_similar_users_ratings = similar_users_ratings.mean(axis=0)
-
-        recommendations = self.recommend_restaurants(user_id, review_df)
-        predicted_ratings = []
-        for business_id in recommendations:
-            business_code = self.business_ids_df.loc[self.business_ids_df['business_id'] == business_id, 'business_code'].values[0]
-            predicted_rating = avg_similar_users_ratings[business_code]
-            predicted_ratings.append(predicted_rating)
-
-        return recommendations, predicted_ratings
+        self.sorted = review_train_df.groupby('business_id').stars.mean().sort_values().reset_index()['business_id'].to_numpy()[::-1]
 
     def predict(self, review_val_df, user_df, business_df, predict_per_user=10):
-        predictions = []
-        user_suggestions = []
+        user_suggestions = pd.Series()
+        predicted_stars = pd.Series(np.ones((len(review_val_df))) * 3, index=review_val_df.index)
 
-        for user_id in user_df['user_id'].unique():
-            if user_id in self.user_ids_df['user_id'].values:
-                recommendations, predicted_ratings = self.predict_stars(user_id, review_val_df)
-                predictions.extend(predicted_ratings[:predict_per_user])
-                user_suggestions.extend(recommendations[:predict_per_user])
+        for user_id in user_df.user_id.unique():
+            if user_id not in self.user_ids_df['user_id'].unique():
+                user_suggestions = pd.concat([user_suggestions, pd.Series([self.sorted[:predict_per_user].tolist()], index=[user_id])]) 
+                predicted_stars.loc[review_val_df['user_id'] == user_id] = review_val_df.loc[review_val_df['user_id'] == user_id, 'business_id'].apply(lambda business: self.business_medians.get(business, self.median_stars))
+                continue
 
-        return pd.Series(predictions), pd.Series(user_suggestions)
+            user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].iloc[0]
+            user_similarities = np.squeeze(np.asarray(self.user_similarity[user_code].toarray()))
+            user_similarities[user_code] = 0
+
+            new_user_similarities = np.zeros_like(user_similarities)
+            new_user_similarities[np.argsort(user_similarities)[::-1][:self.n_neighbours]] = user_similarities[np.argsort(user_similarities)[::-1][:self.n_neighbours]]
+
+            user_similarities = new_user_similarities.reshape((-1, 1))
+
+            business_scores = np.squeeze(np.asarray((self.user_item_sparse_matrix.multiply(user_similarities)).sum(axis=0) / ((self.user_item_sparse_matrix > 0).multiply(user_similarities).sum(axis=0) + 1e-6)))
+
+            top_codes = np.argsort(business_scores)[::-1][:predict_per_user]
+
+            top_ids = []
+
+            for business_code in top_codes:
+                business_id = self.business_ids_df.loc[self.business_ids_df['business_code'] == business_code, 'business_id'].iloc[0]
+                top_ids.append(business_id)
+            
+            user_suggestions = pd.concat([user_suggestions, pd.Series([top_ids], index=[user_id])])
+
+            business_stars_ser = pd.Series(business_scores, index=self.business_ids_df.sort_values('business_code')['business_id'])
+            business_stars_ser.loc[business_stars_ser == 0] = self.business_medians.loc[business_stars_ser.index[business_stars_ser == 0]]
+
+            predicted_stars.loc[review_val_df['user_id'] == user_id] = review_val_df.loc[review_val_df['user_id'] == user_id, 'business_id'].apply(lambda business: business_stars_ser.get(business, self.median_stars))
+
+        return predicted_stars, user_suggestions
+
     
 class ItemItemCollaborativeFiltering(BaseModel):
-    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.]):
+    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.], n_neighbours=20):
         super().__init__(target_col, unique_stars)
         self.user_item_sparse_matrix = None
-        self.item_user_sparse_matrix = None
         self.reduced_matrix = None
         self.index = None
         self.user_ids_df = None
         self.business_ids_df = None
+        self.n_neighbours = n_neighbours
 
     def fit(self, review_train_df, user_df, business_df):
         # Merge dataframes to ensure we have matching records
-        review_df_filtered = review_train_df.merge(user_df[['user_id']], on='user_id', how='inner')
+        review_df_filtered = review_train_df.groupby(['user_id', 'business_id']).agg({'stars':'last','date':'last'}).reset_index()
+        review_df_filtered = review_df_filtered.merge(user_df[['user_id']], on='user_id', how='inner')
         review_df_filtered = review_df_filtered.merge(business_df[['business_id']], on='business_id', how='inner')
         
         # Create user and business ID mappings
-        user_ids = review_df_filtered['user_id'].astype('category').cat.codes
-        business_ids = review_df_filtered['business_id'].astype('category').cat.codes
-        stars = review_df_filtered[self.target_col]
+        user_codes = review_df_filtered['user_id'].astype('category').cat.codes
+        business_codes = review_df_filtered['business_id'].astype('category').cat.codes
+
+        self.median_stars = review_df_filtered['stars'].median()
+
+        stars = review_df_filtered['stars']
 
         # Create the user-item matrix
-        self.user_item_sparse_matrix = coo_matrix((stars, (user_ids, business_ids)))
-        self.user_item_sparse_matrix = self.user_item_sparse_matrix.tocsr()
-
-        # Transpose to get item-user matrix
-        self.item_user_sparse_matrix = self.user_item_sparse_matrix.T
+        self.item_user_sparse_matrix = coo_matrix((stars, (business_codes, user_codes))).tocsr()
         
         # Create DataFrames for user and business IDs
-        user_ids.name = "user_code"
-        self.user_ids_df = pd.concat((user_ids, review_df_filtered['user_id']), axis=1)
+        user_codes.name = "user_code"
+        self.user_ids_df = pd.concat((user_codes, review_df_filtered['user_id']), axis=1)
 
-        business_ids.name = "business_code"
-        self.business_ids_df = pd.concat((business_ids, review_df_filtered['business_id']), axis=1)
+        business_codes.name = "business_code"
+        self.business_ids_df = pd.concat((business_codes, review_df_filtered['business_id']), axis=1).drop_duplicates()
+
+        self.business_medians = review_df_filtered.groupby('business_id')['stars'].median()
         
-        # Reduce dimensions using SVD
-        svd = TruncatedSVD(n_components=100)
-        self.reduced_matrix = svd.fit_transform(self.item_user_sparse_matrix)
-        self.reduced_matrix = self.reduced_matrix.astype(np.float32)
+        self.business_similarity = cosine_similarity(self.item_user_sparse_matrix, dense_output=False)
 
-        # Create FAISS index
-        self.index = faiss.IndexFlatIP(self.reduced_matrix.shape[1])
-        faiss.normalize_L2(self.reduced_matrix)
-        self.index.add(self.reduced_matrix)
-
-    def recommend_restaurants(self, user_id, review_df, n_recommendations=5, n_neighbours=100):
-        # Get items rated by the user
-        user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].values[0]
-        user_ratings = self.user_item_sparse_matrix[user_code].toarray().flatten()
-        rated_items = np.where(user_ratings > 0)[0]
-
-        # Find similar items for each rated item
-        recommendations = pd.Series()
-        for item in rated_items:
-            sim_scores, sim_item_codes = self.index.search(self.reduced_matrix[item].reshape(1, -1), n_neighbours)
-            sim_scores, sim_item_codes = sim_scores[0], sim_item_codes[0]
-            sim_scores = sim_scores[sim_item_codes != item]
-            sim_item_codes = sim_item_codes[sim_item_codes != item]
-            similar_items = pd.Series(sim_scores, index=sim_item_codes)
-            recommendations = recommendations.append(similar_items)
-
-        # Average the similarity scores
-        recommendations = recommendations.groupby(recommendations.index).mean()
-        
-        # Get visited restaurant codes by the user
-        visited_restaurants = review_df[review_df['user_id'] == user_id]['business_id'].unique()
-        visited_business_codes = self.business_ids_df[self.business_ids_df['business_id'].isin(visited_restaurants)]['business_code'].values
-        
-        # Filter out already visited restaurants
-        recommendations = recommendations.drop(visited_business_codes, errors='ignore')
-        recommendations = recommendations.sort_values(ascending=False).head(n_recommendations)
-
-        # Convert back to business IDs
-        res = []
-        for code in recommendations.index:
-            business_id = self.business_ids_df.loc[self.business_ids_df['business_code'] == code, 'business_id'].values[0]
-            res.append(business_id)
-        
-        return res
-
-    def predict_stars(self, user_id, review_df):
-        recommendations = self.recommend_restaurants(user_id, review_df)
-        predicted_ratings = []
-
-        user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].values[0]
-        user_ratings = self.user_item_sparse_matrix[user_code].toarray().flatten()
-
-        for business_id in recommendations:
-            business_code = self.business_ids_df.loc[self.business_ids_df['business_id'] == business_id, 'business_code'].values[0]
-            sim_scores, sim_item_codes = self.index.search(self.reduced_matrix[business_code].reshape(1, -1), 100)
-            sim_scores, sim_item_codes = sim_scores[0], sim_item_codes[0]
-            sim_scores = sim_scores[sim_item_codes != business_code]
-            sim_item_codes = sim_item_codes[sim_item_codes != business_code]
-            similar_items_ratings = user_ratings[sim_item_codes]
-            predicted_rating = np.dot(sim_scores, similar_items_ratings) / (np.abs(sim_scores).sum() + 1e-8)
-            predicted_ratings.append(predicted_rating)
-
-        return recommendations, predicted_ratings
+        self.sorted = review_train_df.groupby('business_id').stars.mean().sort_values().reset_index()['business_id'].to_numpy()[::-1]
 
     def predict(self, review_val_df, user_df, business_df, predict_per_user=10):
-        predictions = []
-        user_suggestions = []
+        user_suggestions = pd.Series()
+        predicted_stars = pd.Series(np.ones((len(review_val_df))) * 3, index=review_val_df.index)
 
-        for user_id in user_df['user_id'].unique():
-            if user_id in self.user_ids_df['user_id'].values:
-                recommendations, predicted_ratings = self.predict_stars(user_id, review_val_df)
-                predictions.extend(predicted_ratings[:predict_per_user])
-                user_suggestions.extend(recommendations[:predict_per_user])
+        for user_id in user_df.user_id.unique():
+            if user_id not in self.user_ids_df['user_id'].unique():
+                user_suggestions = pd.concat([user_suggestions, pd.Series([self.sorted[:predict_per_user].tolist()], index=[user_id])]) 
+                predicted_stars.loc[review_val_df['user_id'] == user_id] = review_val_df.loc[review_val_df['user_id'] == user_id, 'business_id'].apply(lambda business: self.business_medians.get(business, self.median_stars))
+                continue
 
-        return pd.Series(predictions), pd.Series(user_suggestions)
+            user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].iloc[0]
+            user_ratings = self.item_user_sparse_matrix[:, user_code].toarray().flatten()
+
+            business_scores = np.zeros(self.item_user_sparse_matrix.shape[0])
+            business_weights = np.zeros(self.item_user_sparse_matrix.shape[0])
+
+            for business_code in np.where(user_ratings > 0)[0]:
+                businesses_similarity = self.business_similarity[business_code].toarray().flatten()
+                businesses_similarity[business_code] = 0
+                new_businesses_similarity = np.zeros_like(businesses_similarity)
+                top_similar_indices = np.argsort(businesses_similarity)[::-1][:self.n_neighbours]
+                new_businesses_similarity[top_similar_indices] = businesses_similarity[top_similar_indices]
+                business_scores += new_businesses_similarity * user_ratings[business_code]
+                business_weights += new_businesses_similarity
+
+            business_scores[business_weights > 0] /= business_weights[business_weights > 0]
+
+            top_codes = np.argsort(business_scores)[::-1][:predict_per_user]
+
+            top_ids = []
+
+            for business_code in top_codes:
+                business_id = self.business_ids_df.loc[self.business_ids_df['business_code'] == business_code, 'business_id'].iloc[0]
+                top_ids.append(business_id)
+            
+            user_suggestions = pd.concat([user_suggestions, pd.Series([top_ids], index=[user_id])])
+
+            business_stars_ser = pd.Series(business_scores, index=self.business_ids_df.sort_values('business_code')['business_id'])
+            business_stars_ser.loc[business_stars_ser == 0] = self.business_medians.loc[business_stars_ser.index[business_stars_ser == 0]]
+
+            predicted_stars.loc[review_val_df['user_id'] == user_id] = review_val_df.loc[review_val_df['user_id'] == user_id, 'business_id'].apply(lambda business: business_stars_ser.get(business, self.median_stars))
+
+        return predicted_stars, user_suggestions

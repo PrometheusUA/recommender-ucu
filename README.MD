@@ -49,3 +49,9 @@ There are several folders in the dataset:
 - **`experiments`** — a folder with experiments tracking, notebooks and their descriptions in markdown format.
 - **`scripts`** — a folder with useful python scripts.
 - **`src`** — a folder with all source python files for models and their evaluation.
+
+### Experiments
+
+Experiment name is a folder name in `experiments` folder. Usually it contains experiment start date, author(s) of experiment and its main subject.
+
+The folder with experiment can contain several python notebooks, some supplementary code etc. Main files there are `experiment.ipynb` and `description.md`, or other python notebook and markdown file if those are absent. Python notebook here contains experiment main runs, while markdown file contains description of the experiment. Sometimes, description of the experiment is located in the Jupyter notebook itself.
