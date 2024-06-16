@@ -20,14 +20,15 @@ from src.models._base import BaseModel
 
 nltk.download('stopwords')
 
-glove_file = 'glove.6B.100d.txt'
+glove_file = '../../data/glove.6B.100d.txt'
 
 class ContentBasedModel(BaseModel):
-    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.]):
+    def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.], glove_file=glove_file):
         super().__init__(target_col, unique_stars)
         self.embeddings_index = {}
         self.restaurant_vectors = None
         self.user_vectors = None
+        self.load_glove_vectors(glove_file)
 
     def preprocess_text(self, text):
         text = re.sub(f'[{re.escape(string.punctuation)}]', '', text)
@@ -47,8 +48,9 @@ class ContentBasedModel(BaseModel):
                 vector = np.asarray(values[1:], dtype='float32')
                 self.embeddings_index[word] = vector
 
-    def get_average_vector(self, text, embeddings_index):
+    def get_average_vector(self, text):
         words = text.split()
+
         word_vectors = [self.embeddings_index[word] for word in words if word in self.embeddings_index]
         if word_vectors:
             return np.mean(word_vectors, axis=0)
@@ -63,13 +65,15 @@ class ContentBasedModel(BaseModel):
         
         self.restaurant_vectors = review_train_df_filtered.groupby('business_id')['review_vector'].apply(lambda x: np.mean(np.vstack(x.tolist()), axis=0))
         self.user_vectors = review_train_df_filtered.groupby('user_id')['review_vector'].apply(lambda x: np.mean(np.vstack(x.tolist()), axis=0))
+        self.review_train_df = review_train_df_filtered 
+        self.default_restaurant_vector = np.mean(np.vstack(self.restaurant_vectors.tolist()), axis=0)
+        self.defaul_user_vector = np.mean(np.vstack(self.user_vectors.tolist()), axis=0)
 
     def recommend_restaurants(self, user_id, review_df, top_n=10):
-        if user_id not in self.user_vectors:
+        if user_id not in self.user_vectors.index:
             return []
-
         user_vector = self.user_vectors[user_id]
-        visited_restaurants = review_df[review_df['user_id'] == user_id]['business_id'].unique()
+        visited_restaurants = self.review_train_df[self.review_train_df['user_id'] == user_id]['business_id'].unique()
         unvisited_restaurant_vectors = self.restaurant_vectors[~self.restaurant_vectors.index.isin(visited_restaurants)]
 
         similarities = cosine_similarity([user_vector], unvisited_restaurant_vectors.tolist())
@@ -78,28 +82,27 @@ class ContentBasedModel(BaseModel):
 
         return [restaurant for restaurant, score in similarity_scores[:top_n]]
 
-    def predict_stars(self, user_id, review_df):
-        recommendations = self.recommend_restaurants(user_id, review_df)
-        predicted_ratings = []
-        for restaurant in recommendations:
-            restaurant_vector = self.restaurant_vectors[restaurant]
+    def predict_stars(self, user_id, restaurant_id):
+        if restaurant_id in self.restaurant_vectors:
+            restaurant_vector = self.restaurant_vectors[restaurant_id]
+        else:
+            restaurant_vector = self.default_restaurant_vector
+        if user_id in self.user_vectors:
             user_vector = self.user_vectors[user_id]
-            similarity_score = np.dot(user_vector, restaurant_vector) / (np.linalg.norm(user_vector) * np.linalg.norm(restaurant_vector))
-            predicted_rating = round(similarity_score * 5)  # Scale similarity score to star rating
-            predicted_ratings.append(predicted_rating)
-        return recommendations, predicted_ratings
+        else:
+            user_vector = self.defaul_user_vector
+        similarity_score = np.dot(user_vector, restaurant_vector) / (np.linalg.norm(user_vector) * np.linalg.norm(restaurant_vector))
+        predicted_rating = similarity_score * 5  # Scale similarity score to star rating
+        return predicted_rating
 
     def predict(self, review_val_df, user_df, business_df, predict_per_user=10):
         predictions = []
-        user_suggestions = []
+        user_suggestions = user_df.groupby('user_id')['user_id'].apply(lambda user_id: self.recommend_restaurants(user_id.iloc[0], review_df))
 
-        for user_id in user_df['user_id'].unique():
-            if user_id in self.user_vectors:
-                top_suggestions, predicted_stars = self.predict_stars(user_id, review_val_df)
-                user_suggestions.extend(top_suggestions)
-                predictions.extend(predicted_stars)
+        for _, row in review_val_df[["user_id", "business_id"]].iterrows():
+            predictions.append(self.predict_stars(row['user_id'], row['business_id']))
 
-        return pd.Series(predictions), pd.Series(user_suggestions)
+        return pd.Series(predictions), user_suggestions
     
 class UserUserCollaborativeFiltering(BaseModel):
     def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.]):
@@ -141,7 +144,7 @@ class UserUserCollaborativeFiltering(BaseModel):
         faiss.normalize_L2(self.reduced_matrix)
         self.index.add(self.reduced_matrix)
 
-    def recommend_restaurants(self, user_id, review_df, n_recommendations=5, n_neighbours=100):
+    def recommend_restaurants(self, user_id, review_df, n_recommendations=10, n_neighbours=100):
         user_code = self.user_ids_df.loc[self.user_ids_df['user_id'] == user_id, 'user_code'].iloc[0]
         sim_scores, sim_user_codes = self.index.search(self.reduced_matrix[user_code].reshape(1, -1), n_neighbours)
 
@@ -177,7 +180,8 @@ class UserUserCollaborativeFiltering(BaseModel):
 
         recommendations = self.recommend_restaurants(user_id, review_df)
         predicted_ratings = []
-        for business_code in recommendations:
+        for business_id in recommendations:
+            business_code = self.business_ids_df.loc[self.business_ids_df['business_id'] == business_id, 'business_code'].values[0]
             predicted_rating = avg_similar_users_ratings[business_code]
             predicted_ratings.append(predicted_rating)
 
@@ -194,7 +198,6 @@ class UserUserCollaborativeFiltering(BaseModel):
                 user_suggestions.extend(recommendations[:predict_per_user])
 
         return pd.Series(predictions), pd.Series(user_suggestions)
-
     
 class ItemItemCollaborativeFiltering(BaseModel):
     def __init__(self, target_col='stars', unique_stars=[1., 2., 3., 4., 5.]):
