@@ -25,7 +25,7 @@ class BaseModel:
                 review_val_df: pd.DataFrame, 
                 user_df: pd.DataFrame, 
                 business_df: pd.DataFrame, 
-                predict_per_user: int = 10) -> Union[np.ndarray, pd.Series]:
+                predict_per_user: int = 10) -> tuple[Union[np.ndarray, pd.Series], pd.Series]:
         print("WARNING! Predict function is not overrided!")
         return np.ones((len(review_val_df)))
 
@@ -50,7 +50,7 @@ class BaseModel:
 
         # ranking mean precision @1, mean precision @3, mean precision @ K, MAP
         relevant_business_reviews = review_df[review_df[self.target_col] >= 4]
-        relevant_user_businesses = relevant_business_reviews.groupby('user_id')['business_id'].apply(list)
+        relevant_user_businesses = relevant_business_reviews.groupby('user_id', observed=True)['business_id'].apply(list)
         relevant_user_businesses.name = "relevant_items"
 
         user_suggestions.name = "user_suggestions"
