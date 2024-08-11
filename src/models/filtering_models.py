@@ -78,7 +78,9 @@ class ContentBasedModel(BaseModel):
     def fit(self, review_train_df, user_df, business_df):
         review_train_df['cleaned_text'] = review_train_df['text'].apply(self.preprocess_text)
         review_train_df['review_vector'] = review_train_df['cleaned_text'].apply(lambda x: self.get_average_vector(x))
-        review_train_df_filtered = review_train_df[review_train_df['review_vector'].apply(lambda x: not np.allclose(np.zeros(self.embeddings_index[list(self.embeddings_index.keys())[0]].shape), x))]
+        review_vectors = np.stack(review_train_df['review_vector'].values)
+        non_zero_columns_mask = ~np.all(review_vectors == 0, axis=0)
+        review_train_df_filtered = review_train_df.loc[non_zero_columns_mask].copy()
         
         self.review_train_df = review_train_df_filtered
 

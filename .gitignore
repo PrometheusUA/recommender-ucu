@@ -2,3 +2,4 @@
 data/yelp_dataset
 data/glove.*.txt
 __pycache__
+experiments/20240808_andrii_ranking/models
